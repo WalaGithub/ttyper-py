@@ -37,26 +37,58 @@ _BORDER_BOX = {
     "quadrantoutside": "rounded",
 }
 
-_BLOCKS = " ▁▂▃▄▅▆▇█"
+# Braille cells pack a 2-wide x 4-tall grid of dots; this maps a
+# (row-within-cell, column-within-cell) sub-pixel to its dot bit.
+_BRAILLE_BASE = 0x2800
+_BRAILLE_DOTS = (
+    (0x01, 0x08),
+    (0x02, 0x10),
+    (0x04, 0x20),
+    (0x40, 0x80),
+)
 
 
-def _block_chart(values: list[float], height: int = 6) -> list[str]:
-    """Render ``values`` as a column block-chart, top row first."""
-    if not values:
+def _braille_line_chart(values: list[float], width: int, height: int) -> list[str]:
+    """Render ``values`` as a Braille line chart resampled to ``width`` cells.
+
+    Returns ``height`` rows (top first). Like the original's Braille marker
+    line: the data is resampled to the available width and consecutive points
+    are joined vertically so the line stays continuous.
+    """
+    if not values or width < 1 or height < 1:
         return []
+
+    sub_w = width * 2
+    sub_h = height * 4
     lo, hi = min(values), max(values)
     span = hi - lo or 1.0
-    levels = [round((v - lo) / span * (height * 8)) for v in values]
+    n = len(values)
 
-    rows: list[str] = []
-    for row in range(height - 1, -1, -1):
-        floor = row * 8
-        cells = []
-        for level in levels:
-            filled = max(0, min(8, level - floor))
-            cells.append(_BLOCKS[filled])
-        rows.append("".join(cells))
-    return rows
+    # Resample to one y (0 = bottom) per sub-pixel column.
+    ys: list[int] = []
+    for i in range(sub_w):
+        pos = 0.0 if sub_w == 1 else i / (sub_w - 1) * (n - 1)
+        low = int(pos)
+        high = min(low + 1, n - 1)
+        v = values[low] + (values[high] - values[low]) * (pos - low)
+        ys.append(round((v - lo) / span * (sub_h - 1)))
+
+    canvas = [[0] * width for _ in range(height)]
+
+    def plot(sx: int, sy_from_bottom: int) -> None:
+        sy = (sub_h - 1) - sy_from_bottom  # flip to top-origin
+        cx, cy = sx // 2, sy // 4
+        if 0 <= cx < width and 0 <= cy < height:
+            canvas[cy][cx] |= _BRAILLE_DOTS[sy % 4][sx % 2]
+
+    for i in range(sub_w):
+        plot(i, ys[i])
+        if i > 0:  # connect to previous point so the line is continuous
+            a, b = ys[i - 1], ys[i]
+            for yy in range(min(a, b), max(a, b) + 1):
+                plot(i, yy)
+
+    return ["".join(chr(_BRAILLE_BASE + cell) for cell in row) for row in canvas]
 
 
 class View(Static):
@@ -67,6 +99,10 @@ class View(Static):
         if isinstance(app.state, Results):
             return self._render_results(app.state, app.config)
         return self._render_test(app.state, app.config)
+
+    def on_resize(self, event: events.Resize) -> None:
+        # The chart is sized to the widget, so it must be redrawn on resize.
+        self.refresh()
 
     # -- test ----------------------------------------------------------------
     def _render_test(self, test: Test, config: Config) -> RenderableType:
@@ -135,24 +171,32 @@ class View(Static):
 
         top = Columns([overview_panel, worst_panel], expand=True, equal=True)
 
-        # WPM rolling-average chart.
+        # WPM rolling-average chart, sized to the available width/height.
         per_event = results.timing.per_event
         chart: RenderableType = Text("")
+        # Leave room for the top panels (~6), footer (1) and chart chrome (~4).
+        chart_h = max(4, self.size.height - 13)
+        # 5 cols for the y-axis label, 2 for the panel border.
+        chart_w = max(10, self.size.width - 7)
         if len(per_event) >= WPM_SMA_WIDTH:
             wpm_sma = [
                 WPM_SMA_WIDTH / sum(per_event[i : i + WPM_SMA_WIDTH]) * WPM_PER_CPS
                 for i in range(len(per_event) - WPM_SMA_WIDTH + 1)
             ]
-            rows = _block_chart(wpm_sma, height=6)
+            rows = _braille_line_chart(wpm_sma, chart_w, chart_h)
             chart_body = Text(style=theme.results_chart)
             ymax, ymin = max(wpm_sma), min(wpm_sma)
             for i, row in enumerate(rows):
-                label = ymax if i == 0 else (ymin if i == len(rows) - 1 else "")
-                prefix = f"{label:>5.0f} " if label != "" else " " * 6
+                if i == 0:
+                    prefix = f"{ymax:>4.0f} "
+                elif i == len(rows) - 1:
+                    prefix = f"{ymin:>4.0f} "
+                else:
+                    prefix = "     "
                 chart_body.append(prefix, style=theme.results_chart_y)
                 chart_body.append(row + "\n")
             chart_body.append(
-                "      WPM (10-keypress rolling average)", style=theme.results_chart_x
+                "     WPM (10-keypress rolling average)", style=theme.results_chart_x
             )
             chart = Panel(
                 chart_body, title=Text("Chart", style=theme.title), title_align="left",
